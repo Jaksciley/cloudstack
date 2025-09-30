@@ -32,6 +32,7 @@ import javax.naming.ConfigurationException;
 
 import org.apache.cloudstack.api.command.user.loadbalancer.CreateLoadBalancerRuleCmd;
 import org.apache.cloudstack.config.ApiServiceConfiguration;
+import org.apache.cloudstack.engine.orchestration.service.NetworkOrchestrationService;
 import org.apache.cloudstack.framework.config.dao.ConfigurationDao;
 import org.apache.cloudstack.managed.context.ManagedContextRunnable;
 import org.springframework.stereotype.Component;
@@ -201,7 +202,7 @@ public class ElasticLoadBalancerManagerImpl extends ManagerBase implements Elast
         NetworkOffering offering = _networkOfferingDao.findById(guestNetworkId);
         String maxconn = null;
         if (offering.getConcurrentConnections() == null) {
-            maxconn = _configDao.getValue(Config.NetworkLBHaproxyMaxConn.key());
+            maxconn = NetworkOrchestrationService.NETWORK_LB_HAPROXY_MAX_CONN.value().toString();
         } else {
             maxconn = offering.getConcurrentConnections().toString();
         }
@@ -247,7 +248,7 @@ public class ElasticLoadBalancerManagerImpl extends ManagerBase implements Elast
         DomainRouterVO elbVm = findElbVmForLb(rules.get(0));
 
         if (elbVm == null) {
-            logger.warn("Unable to apply lb rules, ELB vm  doesn't exist in the network " + network.getId());
+            logger.warn("Unable to apply lb rules, ELB vm doesn't exist in the network {}", network);
             throw new ResourceUnavailableException("Unable to apply lb rules", DataCenter.class, network.getDataCenterId());
         }
 
@@ -267,10 +268,10 @@ public class ElasticLoadBalancerManagerImpl extends ManagerBase implements Elast
             }
             return applyLBRules(elbVm, lbRules, network.getId());
         } else if (elbVm.getState() == State.Stopped || elbVm.getState() == State.Stopping) {
-            logger.debug("ELB VM is in " + elbVm.getState() + ", so not sending apply LoadBalancing rules commands to the backend");
+            logger.debug(String.format("ELB VM %s is in %s, so not sending apply LoadBalancing rules commands to the backend", elbVm, elbVm.getState()));
             return true;
         } else {
-            logger.warn("Unable to apply loadbalancing rules, ELB VM is not in the right state " + elbVm.getState());
+            logger.warn(String.format("Unable to apply loadbalancing rules, ELB VM %s is not in the right state %s", elbVm, elbVm.getState()));
             throw new ResourceUnavailableException("Unable to apply loadbalancing rules, ELB VM is not in the right state", VirtualRouter.class, elbVm.getId());
         }
     }
