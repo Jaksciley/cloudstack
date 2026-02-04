@@ -71,6 +71,7 @@ import com.cloud.agent.api.StartCommand;
 import com.cloud.agent.api.StopAnswer;
 import com.cloud.agent.api.StopCommand;
 import com.cloud.agent.api.to.VirtualMachineTO;
+import com.cloud.host.Host;
 import com.cloud.host.HostVO;
 import com.cloud.host.dao.HostDao;
 import com.cloud.hypervisor.ExternalProvisioner;
@@ -103,10 +104,11 @@ public class ExternalPathPayloadProvisioner extends ManagerBase implements Exter
             BASE_EXTERNAL_PROVISIONER_SCRIPTS_DIR + "/provisioner.sh";
 
     private static final String PROPERTIES_FILE = "server.properties";
+    private static final String EXTENSIONS = "extensions";
     private static final String EXTENSIONS_DEPLOYMENT_MODE_NAME = "extensions.deployment.mode";
     private static final String EXTENSIONS_DIRECTORY_PROD = "/usr/share/cloudstack-management/extensions";
-    private static final String EXTENSIONS_DATA_DIRECTORY_PROD = "/var/lib/cloudstack/management/extensions";
-    private static final String EXTENSIONS_DIRECTORY_DEV = "extensions";
+    private static final String EXTENSIONS_DATA_DIRECTORY_PROD = System.getProperty("user.home") + File.separator + EXTENSIONS;
+    private static final String EXTENSIONS_DIRECTORY_DEV = EXTENSIONS;
     private static final String EXTENSIONS_DATA_DIRECTORY_DEV = "client/target/extensions-data";
 
     @Inject
@@ -127,7 +129,7 @@ public class ExternalPathPayloadProvisioner extends ManagerBase implements Exter
     private ExecutorService payloadCleanupExecutor;
     private ScheduledExecutorService payloadCleanupScheduler;
     private static final List<String> TRIVIAL_ACTIONS = Arrays.asList(
-            "status"
+            "status", "statuses"
     );
 
     @Override
@@ -455,7 +457,7 @@ public class ExternalPathPayloadProvisioner extends ManagerBase implements Exter
     @Override
     public Map<String, HostVmStateReportEntry> getHostVmStateReport(long hostId, String extensionName,
                             String extensionRelativePath) {
-        final Map<String, HostVmStateReportEntry> vmStates = new HashMap<>();
+        Map<String, HostVmStateReportEntry> vmStates = new HashMap<>();
         String extensionPath = getExtensionCheckedPath(extensionName, extensionRelativePath);
         if (StringUtils.isEmpty(extensionPath)) {
             return vmStates;
@@ -465,14 +467,20 @@ public class ExternalPathPayloadProvisioner extends ManagerBase implements Exter
             logger.error("Host with ID: {} not found", hostId);
             return vmStates;
         }
+        Map<String, Map<String, String>> accessDetails =
+                extensionsManager.getExternalAccessDetails(host, null);
+        vmStates = getVmPowerStates(host, accessDetails, extensionName, extensionPath);
+        if (vmStates != null) {
+            logger.debug("Found {} VMs on the host {}", vmStates.size(), host);
+            return vmStates;
+        }
+        vmStates = new HashMap<>();
         List<UserVmVO> allVms = _uservmDao.listByHostId(hostId);
         allVms.addAll(_uservmDao.listByLastHostId(hostId));
         if (CollectionUtils.isEmpty(allVms)) {
             logger.debug("No VMs found for the {}", host);
             return vmStates;
         }
-        Map<String, Map<String, String>> accessDetails =
-                extensionsManager.getExternalAccessDetails(host, null);
         for (UserVmVO vm: allVms) {
             VirtualMachine.PowerState powerState = getVmPowerState(vm, accessDetails, extensionName, extensionPath);
             vmStates.put(vm.getInstanceName(), new HostVmStateReportEntry(powerState, "host-" + hostId));
@@ -630,18 +638,18 @@ public class ExternalPathPayloadProvisioner extends ManagerBase implements Exter
             }
             if (!Files.isDirectory(filePath) && !Files.isRegularFile(filePath)) {
                 throw new CloudRuntimeException(
-                        String.format("Failed to cleanup extension entry-point: %s for extension: %s as it either " +
+                        String.format("Failed to cleanup path: %s for extension: %s as it either " +
                                         "does not exist or is not a regular file/directory",
                                 extensionName, extensionRelativePath));
             }
             if (!FileUtil.deleteRecursively(filePath)) {
                 throw new CloudRuntimeException(
-                        String.format("Failed to delete extension entry-point: %s for extension: %s",
+                        String.format("Failed to delete path: %s for extension: %s",
                                 extensionName, filePath));
             }
         } catch (IOException e) {
             throw new CloudRuntimeException(
-                    String.format("Failed to cleanup extension entry-point: %s for extension: %s due to: %s",
+                    String.format("Failed to cleanup path: %s for extension: %s due to: %s",
                             extensionName, normalizedPath, e.getMessage()), e);
         }
     }
@@ -713,7 +721,7 @@ public class ExternalPathPayloadProvisioner extends ManagerBase implements Exter
             return getPowerStateFromString(response);
         }
         try {
-            JsonObject jsonObj = new JsonParser().parse(response).getAsJsonObject();
+            JsonObject jsonObj = JsonParser.parseString(response).getAsJsonObject();
             String powerState = jsonObj.has("power_state") ? jsonObj.get("power_state").getAsString() : null;
             return getPowerStateFromString(powerState);
         } catch (Exception e) {
@@ -723,7 +731,7 @@ public class ExternalPathPayloadProvisioner extends ManagerBase implements Exter
         }
     }
 
-    private VirtualMachine.PowerState getVmPowerState(UserVmVO userVmVO, Map<String, Map<String, String>> accessDetails,
+    protected VirtualMachine.PowerState getVmPowerState(UserVmVO userVmVO, Map<String, Map<String, String>> accessDetails,
                   String extensionName, String extensionPath) {
         VirtualMachineTO virtualMachineTO = getVirtualMachineTO(userVmVO);
         accessDetails.put(ApiConstants.VIRTUAL_MACHINE, virtualMachineTO.getExternalDetails());
@@ -739,6 +747,46 @@ public class ExternalPathPayloadProvisioner extends ManagerBase implements Exter
         }
         return parsePowerStateFromResponse(userVmVO, result.second());
     }
+
+    protected Map<String, HostVmStateReportEntry> getVmPowerStates(Host host,
+                   Map<String, Map<String, String>> accessDetails, String extensionName, String extensionPath) {
+        Map<String, Object> modifiedDetails = loadAccessDetails(accessDetails, null);
+        logger.debug("Trying to get VM power statuses from the external system for {}", host);
+        Pair<Boolean, String> result = getInstanceStatusesOnExternalSystem(extensionName, extensionPath,
+                host.getName(), modifiedDetails, AgentManager.Wait.value());
+        if (!result.first()) {
+            logger.warn("Failure response received while trying to fetch the power statuses for {} : {}",
+                    host, result.second());
+            return null;
+        }
+        if (StringUtils.isBlank(result.second())) {
+            logger.warn("Empty response while trying to fetch VM power statuses for host: {}", host);
+            return null;
+        }
+        try {
+            JsonObject jsonObj = JsonParser.parseString(result.second()).getAsJsonObject();
+            if (!jsonObj.has("status") || !"success".equalsIgnoreCase(jsonObj.get("status").getAsString())) {
+                logger.warn("Invalid status in response while trying to fetch VM power statuses for host: {}: {}",
+                        host, result.second());
+                return null;
+            }
+            if (!jsonObj.has("power_state") || !jsonObj.get("power_state").isJsonObject()) {
+                logger.warn("Missing or invalid power_state in response for host: {}: {}", host, result.second());
+                return null;
+            }
+            JsonObject powerStates = jsonObj.getAsJsonObject("power_state");
+            Map<String, HostVmStateReportEntry> states = new HashMap<>();
+            for (Map.Entry<String, com.google.gson.JsonElement> entry : powerStates.entrySet()) {
+                VirtualMachine.PowerState powerState = getPowerStateFromString(entry.getValue().getAsString());
+                states.put(entry.getKey(), new HostVmStateReportEntry(powerState, "host-" + host.getId()));
+            }
+            return states;
+        } catch (Exception e) {
+            logger.warn("Failed to parse VM power statuses response for host: {}: {}", host, e.getMessage());
+            return null;
+        }
+    }
+
     public Pair<Boolean, String> prepareExternalProvisioningInternal(String extensionName, String filename,
                              String vmUUID, Map<String, Object> accessDetails, int wait) {
         return executeExternalCommand(extensionName, "prepare", accessDetails, wait,
@@ -780,6 +828,12 @@ public class ExternalPathPayloadProvisioner extends ManagerBase implements Exter
                                Map<String, Object> accessDetails, int wait) {
         return executeExternalCommand(extensionName, "status", accessDetails, wait,
                 String.format("Failed to get the instance power status %s on external system", vmUUID), filename);
+    }
+
+    public Pair<Boolean, String> getInstanceStatusesOnExternalSystem(String extensionName, String filename,
+                               String hostName, Map<String, Object> accessDetails, int wait) {
+        return executeExternalCommand(extensionName, "statuses", accessDetails, wait,
+                String.format("Failed to get the %s instances power status on external system", hostName), filename);
     }
 
     public Pair<Boolean, String> getInstanceConsoleOnExternalSystem(String extensionName, String filename,
